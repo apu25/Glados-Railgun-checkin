@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import logging
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -552,6 +553,25 @@ class Checker:
         """获取所有结果"""
         return [result.to_dict() for result in self.results]
 
+    def failed_cookie_indexes(self) -> List[int]:
+        """任一域名成功或重复签到即视为该 Cookie 已完成。"""
+        return [index for index in range(1, len(self.config.cookies_list) + 1)
+                if not any(r.cookie_index == index and r.code in
+                           (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+                           for r in self.results)]
+
+    def retry_failed(self) -> None:
+        failed = self.failed_cookie_indexes()
+        if not failed:
+            return
+        logger.warning("签到失败的账号将在 30 秒后重试一次。")
+        time.sleep(30)
+        for index in failed:
+            self.results = [r for r in self.results if r.cookie_index != index]
+            for domain in self.config.DOMAINS:
+                self.results.append(self._checkin_on_domain(
+                    self.config.cookies_list[index - 1], index, domain))
+
     def format_results(self) -> Tuple[str, str, str]:
         """格式化结果"""
         results = self.get_results()
@@ -585,6 +605,8 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    failed = True
+    config = None
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -598,6 +620,11 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
+            checker.retry_failed()
+            failed_indexes = checker.failed_cookie_indexes()
+            failed = bool(failed_indexes)
+            if failed:
+                logger.error(f"签到失败的 Cookie 编号: {failed_indexes}")
 
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
@@ -610,10 +637,12 @@ def main():
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
+    if config is not None:
+        push_service = PushService(config)
+        push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

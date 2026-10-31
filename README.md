@@ -71,6 +71,7 @@
 
 
 ## 问题排查与定位
+- 签到失败时脚本会在 30 秒后重试一次。每个 Cookie 至少有一个域名签到成功或显示重复签到才算完成；全部失败或未设置 Cookie 时，Actions 会显示失败。网络和设备问题可自动重试，登录凭证失效仍需重新登录并更新 Secret。请在 GitHub 通知设置中启用 Actions 失败通知，或配置 PushDeer 以接收推送。
 - 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
 - 若日志出现 `code : 4, message : Automated check-in detected`：这是 GLaDOS 的**设备平台校验**（`reason=device-mismatch`，即签到请求 UA 平台与登录设备平台不一致）。脚本已内置**设备平台自适应**：首次失败时自动读取服务端返回的 `loginDevice` 并切换对应平台 UA 重试，**无需手动配置 User-Agent**；若长期仍失败，请重新登录 glados.cloud 手动签到一次并刷新 cookie。
 
