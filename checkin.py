@@ -1,8 +1,10 @@
 import requests
 import json
 import os
+import re
 import logging
 import time
+import hashlib
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -101,6 +103,8 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_DOMAINS = "GLADOS_DOMAINS"
+    ENV_PLATFORM = "GLADOS_PLATFORM"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -123,6 +127,7 @@ class Config:
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        self.DOMAINS = list(type(self).DOMAINS)
         self._load_config()
 
     def _load_config(self) -> None:
@@ -131,6 +136,13 @@ class Config:
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
+        domains_env = os.environ.get(self.ENV_DOMAINS, "").strip()
+        if domains_env:
+            domains = [domain.strip().lower() for domain in domains_env.split(",") if domain.strip()]
+            if not domains or any(domain not in type(self).DOMAINS for domain in domains):
+                raise ValueError("GLADOS_DOMAINS 包含不支持的域名")
+            self.DOMAINS = list(dict.fromkeys(domains))
+        logger.info(f"{LogEmoji.INFO} 签到域名: {', '.join(self.DOMAINS)}")
 
         if not push_key_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
@@ -234,9 +246,13 @@ class API:
 
     def _get_headers(self) -> Dict[str, str]:
         """获取请求头"""
+        platform = os.environ.get(Config.ENV_PLATFORM) or "Windows"
+        if platform not in PLATFORM_UA:
+            logger.warning(f"{LogEmoji.WARNING} 无效的 GLADOS_PLATFORM，使用 Windows 并保留设备自适应重试")
+            platform = "Windows"
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": PLATFORM_UA["Windows"],
+            "user-agent": PLATFORM_UA[platform],
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -273,7 +289,7 @@ class API:
                 return None
 
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
@@ -307,7 +323,30 @@ class API:
 
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        payload = data.copy()
+        if self.domain == "glados.cloud":
+            # 与网站当前的公开签到流程一致：每次请求新挑战，并至少等待 2.5 秒。
+            challenge = self._make_request(self._get_full_url("/api/user/checkin/challenge"), "GET", cookies=cookies, user_agent=user_agent)
+            if challenge is None:
+                self._log("error", LogEmoji.ERROR, "获取签到挑战失败，本次不提交签到", force=True)
+                return None
+            try:
+                challenge_data = challenge.json()
+            except ValueError:
+                self._log("error", LogEmoji.ERROR, "签到挑战响应解析失败，本次不提交签到", force=True)
+                return None
+            if not isinstance(challenge_data, dict):
+                self._log("error", LogEmoji.ERROR, "签到挑战响应格式无效，本次不提交签到", force=True)
+                return None
+            if challenge_data.get("code") != 0 and challenge_data.get("message") in ("没有权限", "No permission"):
+                return {"code": -2, "message": "没有权限"}
+            nonce = challenge_data.get("nonce")
+            if challenge_data.get("code") != 0 or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096:
+                self._log("error", LogEmoji.ERROR, "签到挑战不可用，本次不提交签到", force=True)
+                return None
+            time.sleep(2.5)
+            payload.update({"nonce": nonce, "proof": hashlib.sha256((nonce + ".glados-observer-v1").encode()).hexdigest()})
+        response = self._make_request(url, "POST", payload, cookies, user_agent=user_agent)
         if not response:
             return None
         try:
@@ -344,7 +383,12 @@ class API:
         points = str(raw.get("points", 0))
 
         if code == CheckinStatus.SUCCESS.value:
-            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
+            streak = raw.get("streak")
+            streak_info = f", streak : {streak}" if isinstance(streak, int) and not isinstance(streak, bool) else ""
+            reason = raw.get("reason")
+            reason_info = f", reason : {reason}" if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reason) else ""
+            safe_points = points if isinstance(raw.get("points"), (int, float)) and not isinstance(raw.get("points"), bool) else "未知"
+            self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {safe_points}{streak_info}{reason_info} }}", force=True)
             result["code"] = CheckinStatus.SUCCESS
             result["status"] = "签到成功"
             result["points"] = points
@@ -400,7 +444,9 @@ class API:
 
             if points is not None:
                 points_int = int(float(points))
-                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
+                streak = data.get("streak")
+                streak_info = f", streak : {streak}" if isinstance(streak, int) and not isinstance(streak, bool) else ""
+                self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分{streak_info}}}", force=True)
                 points_str = f"{points_int} 积分"
                 points_num = points_int
                 return points_str, points_num
@@ -527,6 +573,7 @@ class Checker:
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.points = str(checkin_result.get("points", "0"))
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")

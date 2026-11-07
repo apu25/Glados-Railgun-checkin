@@ -53,6 +53,8 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        GLADOS_DOMAINS: ${{ vars.GLADOS_DOMAINS }}
+        GLADOS_PLATFORM: ${{ vars.GLADOS_PLATFORM }}
 
     - name: Keep alive
       uses: liskin/gh-workflow-keepalive@v1 
