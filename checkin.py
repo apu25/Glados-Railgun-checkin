@@ -398,6 +398,8 @@ class API:
             result["status"] = "签到成功"
             result["points"] = points
             result["message"] = message
+            if isinstance(streak, int) and not isinstance(streak, bool):
+                result["streak"] = streak
         elif code == CheckinStatus.REPEAT.value:
             self._log("info", LogEmoji.REPEAT, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.REPEAT
@@ -437,7 +439,7 @@ class API:
             return "None 天", -2
 
     @log_method
-    def get_points(self, cookies: str) -> Tuple[str, int]:
+    def get_points(self, cookies: str) -> Tuple[str, int, Optional[int]]:
         """获取积分"""
         url = self._get_full_url(self.POINTS_URL)
         response = self._make_request(url, "GET", cookies=cookies)
@@ -454,13 +456,14 @@ class API:
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分{streak_info}}}", force=True)
                 points_str = f"{points_int} 积分"
                 points_num = points_int
-                return points_str, points_num
+                streak_num = streak if isinstance(streak, int) and not isinstance(streak, bool) else None
+                return points_str, points_num, streak_num
             else:
                 self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
-                return "None 积分", 0
+                return "None 积分", 0, None
         else:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
-            return "None 积分", 0
+            return "None 积分", 0, None
 
     @log_method
     def exchange(self, cookies: str, plan: str, required_points: int) -> str:
@@ -495,6 +498,9 @@ class CheckinResult:
     days: str = "None"
     points_total: str = "None"
     exchange: str = "未兑换"
+    checkin_streak: Optional[int] = None
+    account_streak: Optional[int] = None
+    anomaly: str = ""
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
@@ -579,11 +585,34 @@ class Checker:
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
             result.points = str(checkin_result.get("points", "0"))
+            checkin_streak = checkin_result.get("streak")
+            if isinstance(checkin_streak, int) and not isinstance(checkin_streak, bool):
+                result.checkin_streak = checkin_streak
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
+            points_str, points_num, account_streak = api.get_points(cookie)
             result.points_total = points_str
+            result.account_streak = account_streak
+
+            # Do not treat code=0 as complete health: the service can accept a
+            # degraded check-in while awarding only one point, or return a streak
+            # that is not persisted by /user/points.
+            if result.code == CheckinStatus.SUCCESS:
+                anomaly_parts = []
+                try:
+                    if float(result.points) <= 1:
+                        anomaly_parts.append(f"本次奖励仅 {result.points} 积分")
+                except (TypeError, ValueError):
+                    anomaly_parts.append("本次奖励无法解析")
+                if (result.checkin_streak is not None and result.account_streak is not None
+                        and result.checkin_streak != result.account_streak):
+                    anomaly_parts.append(
+                        f"签到连续天数 {result.checkin_streak} 未持久化（账户为 {result.account_streak}）")
+                if anomaly_parts:
+                    result.anomaly = "；".join(anomaly_parts)
+                    self._log(cookie_idx, domain, LogEmoji.WARNING,
+                              f"签到健康异常: {result.anomaly}", force=True)
 
             # 4. 执行兑换（未配置有效兑换计划时跳过）
             if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
@@ -612,6 +641,10 @@ class Checker:
                            (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
                            for r in self.results)]
 
+    def anomaly_cookie_indexes(self) -> List[int]:
+        """返回名义成功但奖励或连续天数异常的账号。"""
+        return sorted({r.cookie_index for r in self.results if r.anomaly})
+
     def retry_failed(self) -> None:
         failed = self.failed_cookie_indexes()
         if not failed:
@@ -631,13 +664,16 @@ class Checker:
         success_count = sum(1 for r in results if r["code"] == CheckinStatus.SUCCESS)
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
+        anomaly_count = sum(1 for r in results if r["anomaly"])
 
-        title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
+        title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}, 异常{anomaly_count}"
 
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
             line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            if res["anomaly"]:
+                line += f" | 健康异常: {res['anomaly']}"
             send_content_lines.append(line)
 
             if self.config.verbose:
@@ -674,9 +710,12 @@ def main():
             checker.checkin_all()
             checker.retry_failed()
             failed_indexes = checker.failed_cookie_indexes()
-            failed = bool(failed_indexes)
-            if failed:
+            anomaly_indexes = checker.anomaly_cookie_indexes()
+            failed = bool(failed_indexes or anomaly_indexes)
+            if failed_indexes:
                 logger.error(f"签到失败的 Cookie 编号: {failed_indexes}")
+            if anomaly_indexes:
+                logger.error(f"签到健康异常的 Cookie 编号: {anomaly_indexes}")
 
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
