@@ -251,7 +251,9 @@ class API:
             logger.warning(f"{LogEmoji.WARNING} 无效的 GLADOS_PLATFORM，使用 Windows 并保留设备自适应重试")
             platform = "Windows"
         return {
+            "accept": "application/json, text/plain, */*",
             "origin": f"https://{self.domain}",
+            "referer": f"https://{self.domain}/console/checkin",
             "user-agent": PLATFORM_UA[platform],
         }
 
@@ -281,7 +283,10 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                # The current web client posts JSON.  Sending a dict via ``data=``
+                # uses the legacy form encoding; the service accepts that shape but
+                # may treat it as a degraded/legacy check-in (base reward only).
+                response = self.session.post(url, headers=session_headers, json=data, timeout=(60, 120))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
