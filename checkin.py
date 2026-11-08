@@ -36,6 +36,7 @@ class APIEndpoint(Enum):
     CHECKIN = "/api/user/checkin"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
+    IQI = "/api/user/iqi"
     EXCHANGE = "/api/user/exchange"
 
 
@@ -68,6 +69,7 @@ def log_method(func):
             "checkin": LogEmoji.CHECKIN,
             "get_status": LogEmoji.STATUS,
             "get_points": LogEmoji.POINTS,
+            "get_iqi": LogEmoji.POINTS,
             "exchange": LogEmoji.EXCHANGE,
         }
         emoji = emoji_map.get(method_name, LogEmoji.INFO)
@@ -80,7 +82,8 @@ def log_method(func):
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
                 "get_status": ("None 天", -2),
-                "get_points": ("None 积分", 0),
+                "get_points": ("None 积分", 0, None),
+                "get_iqi": (None, None),
                 "exchange": "",
             }
 
@@ -201,6 +204,7 @@ class API:
     CHECKIN_URL = APIEndpoint.CHECKIN.value
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
+    IQI_URL = APIEndpoint.IQI.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
 
     def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
@@ -466,6 +470,37 @@ class API:
             return "None 积分", 0, None
 
     @log_method
+    def get_iqi(self, cookies: str) -> Tuple[Optional[float], Optional[int]]:
+        """获取网页用于计算每次签到海缆奖励的当前指数。"""
+        response = self._make_request(self._get_full_url(self.IQI_URL), "GET", cookies=cookies)
+        if not response:
+            self._log("warning", LogEmoji.WARNING, "获取海缆指数失败", force=True)
+            return None, None
+
+        data = response.json()
+        score = data.get("data", {}).get("quality", {}).get("score")
+        if data.get("code") != 0 or not isinstance(score, (int, float)) or isinstance(score, bool):
+            self._log("warning", LogEmoji.WARNING, "海缆指数响应格式无效", force=True)
+            return None, None
+
+        score_num = float(score)
+        if score_num <= 0:
+            bonus = 0
+        elif score_num < 80:
+            bonus = 8
+        elif score_num < 85:
+            bonus = 5
+        elif score_num < 90:
+            bonus = 3
+        elif score_num <= 95:
+            bonus = 2
+        else:
+            bonus = 1
+        self._log("info", LogEmoji.SUCCESS,
+                  f"{{ code : 0, iqi : {score_num:g}, cableBonus : {bonus} }}", force=True)
+        return score_num, bonus
+
+    @log_method
     def exchange(self, cookies: str, plan: str, required_points: int) -> str:
         """执行兑换"""
         url = self._get_full_url(self.EXCHANGE_URL)
@@ -500,6 +535,8 @@ class CheckinResult:
     exchange: str = "未兑换"
     checkin_streak: Optional[int] = None
     account_streak: Optional[int] = None
+    iqi_score: Optional[float] = None
+    expected_cable_bonus: Optional[int] = None
     anomaly: str = ""
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
@@ -579,6 +616,10 @@ class Checker:
             days_str, status_code = api.get_status(cookie)
             result.days = days_str
 
+            # The site documents a deterministic cable bonus for each check-in.
+            # Capture it before submitting so the awarded points can be validated.
+            result.iqi_score, result.expected_cable_bonus = api.get_iqi(cookie)
+
             # 2. 签到
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
@@ -603,6 +644,11 @@ class Checker:
                 try:
                     if float(result.points) <= 1:
                         anomaly_parts.append(f"本次奖励仅 {result.points} 积分")
+                    if (result.expected_cable_bonus is not None
+                            and float(result.points) < result.expected_cable_bonus):
+                        anomaly_parts.append(
+                            f"低于海缆奖励下限 {result.expected_cable_bonus} 积分"
+                            f"（指数 {result.iqi_score:g}）")
                 except (TypeError, ValueError):
                     anomaly_parts.append("本次奖励无法解析")
                 if (result.checkin_streak is not None and result.account_streak is not None
